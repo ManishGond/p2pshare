@@ -7,7 +7,6 @@ const socket: Socket = io("http://localhost:3001");
 export default function RTCConnection() {
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
-  const receivedChunksRef = useRef<BlobPart[]>([]);
   const fileMetaRef = useRef<{
     name: string;
     size: number;
@@ -18,6 +17,12 @@ export default function RTCConnection() {
   const [progress, setProgress] = useState(0);
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [fileName, setFileName] = useState<string>("received_file");
+
+  // Writer for streaming received file
+  const fileWriterRef = useRef<WritableStreamDefaultWriter<Uint8Array> | null>(
+    null
+  );
+  const receivedBytesRef = useRef<number>(0);
 
   useEffect(() => {
     const peerConnection = new RTCPeerConnection({
@@ -53,7 +58,7 @@ export default function RTCConnection() {
         setStatus("✅ Data channel open (callee), ready to receive");
       };
 
-      receiveChannel.onmessage = (event) => {
+      receiveChannel.onmessage = async (event) => {
         if (typeof event.data === "string") {
           try {
             const meta = JSON.parse(event.data);
@@ -61,23 +66,66 @@ export default function RTCConnection() {
               fileMetaRef.current = meta;
               setFileName(meta.name);
               setProgress(0);
-              receivedChunksRef.current = [];
+              receivedBytesRef.current = 0;
+
+              // Try File System Access API (if available)
+              if ((window as any).showSaveFilePicker) {
+                const handle = await (window as any).showSaveFilePicker({
+                  suggestedName: meta.name,
+                  types: [
+                    {
+                      description: meta.type,
+                      accept: {
+                        [meta.type]: [`.${meta.name.split(".").pop()}`],
+                      },
+                    },
+                  ],
+                });
+                const writable = await handle.createWritable();
+                const stream = new WritableStream({
+                  async write(chunk) {
+                    await writable.write(chunk);
+                  },
+                  async close() {
+                    await writable.close();
+                    setStatus("📥 File saved to disk!");
+                  },
+                });
+                fileWriterRef.current = stream.getWriter();
+              } else {
+                // Fallback: keep chunks in memory
+                const chunks: BlobPart[] = [];
+                const stream = new WritableStream({
+                  write(chunk) {
+                    chunks.push(chunk);
+                  },
+                  close() {
+                    const blob = new Blob(chunks, { type: meta.type });
+                    const url = URL.createObjectURL(blob);
+                    setDownloadUrl(url);
+                    setStatus("📥 File ready to download!");
+                  },
+                });
+                fileWriterRef.current = stream.getWriter();
+              }
+
               return;
             }
           } catch {}
           if (event.data === "EOF") {
-            const blob = new Blob(receivedChunksRef.current, {
-              type: fileMetaRef.current?.type,
-            });
-            const url = URL.createObjectURL(blob);
-            setDownloadUrl(url);
-            setStatus("📥 File received!");
-            receivedChunksRef.current = [];
+            await fileWriterRef.current?.close();
+            fileWriterRef.current = null;
             return;
           }
         } else if (event.data instanceof ArrayBuffer) {
-          receivedChunksRef.current.push(event.data);
-          setProgress((p) => p + event.data.byteLength);
+          if (fileWriterRef.current && fileMetaRef.current) {
+            await fileWriterRef.current.write(new Uint8Array(event.data));
+            receivedBytesRef.current += event.data.byteLength;
+            const percent = Math.round(
+              (receivedBytesRef.current / fileMetaRef.current.size) * 100
+            );
+            setProgress(percent);
+          }
         }
       };
     };
@@ -145,11 +193,17 @@ export default function RTCConnection() {
     let offset = 0;
 
     while (offset < file.size) {
+      // Backpressure: wait if bufferedAmount is too high
+      while (channel.bufferedAmount > 16 * chunkSize) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+
       const slice = file.slice(offset, offset + chunkSize);
       const buffer = await slice.arrayBuffer();
       channel.send(buffer);
       offset += buffer.byteLength;
-      setProgress(offset);
+
+      setProgress(Math.round((offset / file.size) * 100));
     }
 
     channel.send("EOF");
@@ -163,7 +217,7 @@ export default function RTCConnection() {
 
       <input type="file" onChange={handleFileChange} />
 
-      <p>Progress: {progress} bytes</p>
+      <p>Progress: {progress}%</p>
 
       {downloadUrl && (
         <a href={downloadUrl} download={fileName}>
